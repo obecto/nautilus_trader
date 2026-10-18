@@ -6024,6 +6024,156 @@ fn prepare_accepted_order_with_account(
     (instrument, order)
 }
 
+#[rstest]
+#[case::modify(false)]
+#[case::cancel(true)]
+fn test_filled_order_publishes_late_rejection_without_changing_accounting(
+    mut execution_engine: ExecutionEngine,
+    #[case] cancel: bool,
+    #[values(false, true)] late_increase: bool,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let (instrument, order) = prepare_accepted_order(&mut execution_engine);
+    execution_engine.register_oms_type(order.strategy_id(), OmsType::Hedging);
+    let account_id = order.account_id().unwrap();
+    let venue_order_id = order.venue_order_id().unwrap();
+    let position_id = PositionId::from("P-LATE-REJECTION");
+    let pending = if cancel {
+        OrderEventAny::PendingCancel(build_order_pending_cancel(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            order.client_order_id(),
+            account_id,
+            Some(venue_order_id),
+        ))
+    } else {
+        OrderEventAny::PendingUpdate(build_order_pending_update(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            order.client_order_id(),
+            account_id,
+            Some(venue_order_id),
+        ))
+    };
+    execution_engine.process(&pending);
+    execution_engine.process(&OrderEventAny::Filled(build_order_filled(
+        order.trader_id(),
+        order.strategy_id(),
+        instrument.id(),
+        order.client_order_id(),
+        venue_order_id,
+        account_id,
+        TradeId::from("T-OLD-TOTAL"),
+        order.order_side(),
+        order.order_type(),
+        order.quantity(),
+        Price::from("1.00000"),
+        Currency::USD(),
+        LiquiditySide::Maker,
+        Some(position_id),
+        Some(Money::from("0.02 USD")),
+    )));
+    if late_increase {
+        execution_engine.process(&OrderEventAny::Updated(build_order_updated(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            order.client_order_id(),
+            order.quantity() + Quantity::from(1),
+            Some(venue_order_id),
+            Some(account_id),
+            None,
+            None,
+            None,
+            false,
+        )));
+    }
+    let before = cached_order_or(&execution_engine, &order);
+    assert_eq!(before.status(), OrderStatus::Filled);
+    assert_eq!(
+        before.leaves_qty(),
+        if late_increase {
+            Quantity::from(1)
+        } else {
+            Quantity::from(0)
+        }
+    );
+    let position_before = {
+        let cache = execution_engine.cache().borrow();
+        let position = cache.position(&position_id).unwrap();
+        assert_eq!(position.quantity, order.quantity());
+        assert_eq!(position.commissions(), vec![Money::from("0.02 USD")]);
+        serde_json::to_vec(&*position).unwrap()
+    };
+    let account_before = serde_json::to_vec(
+        &*execution_engine
+            .cache()
+            .borrow()
+            .account(&account_id)
+            .unwrap(),
+    )
+    .unwrap();
+    let received = Rc::new(RefCell::new(Vec::<OrderEventAny>::new()));
+    let handler = TypedHandler::from({
+        let received = received.clone();
+        move |event: &OrderEventAny| received.borrow_mut().push(event.clone())
+    });
+    let topic = switchboard::get_event_order_topic(order.strategy_id());
+    msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+    let rejection = if cancel {
+        OrderEventAny::CancelRejected(build_order_cancel_rejected(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            order.client_order_id(),
+            account_id,
+            Some(venue_order_id),
+        ))
+    } else {
+        OrderEventAny::ModifyRejected(build_order_modify_rejected(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            order.client_order_id(),
+            account_id,
+            Some(venue_order_id),
+        ))
+    };
+    execution_engine.process(&rejection);
+    msgbus::unsubscribe_order_events(topic.into(), &handler);
+
+    assert_eq!(
+        received.borrow().as_slice(),
+        std::slice::from_ref(&rejection)
+    );
+    let cache = execution_engine.cache().borrow();
+    let after = cache.order(&order.client_order_id()).unwrap();
+    assert_eq!(after.last_event(), &rejection);
+    assert_eq!(after.event_count(), before.event_count() + 1);
+    assert_eq!(after.status(), OrderStatus::Filled);
+    assert_eq!(after.ts_closed(), before.ts_closed());
+    assert_eq!(after.quantity(), before.quantity());
+    assert_eq!(after.filled_qty(), before.filled_qty());
+    assert_eq!(after.leaves_qty(), before.leaves_qty());
+    assert_eq!(after.avg_px(), before.avg_px());
+    assert_eq!(after.commissions(), before.commissions());
+    assert_eq!(after.trade_ids(), before.trade_ids());
+    assert_eq!(after.position_id(), before.position_id());
+    assert!(cache.is_order_closed(&order.client_order_id()));
+    assert!(!cache.is_order_open(&order.client_order_id()));
+    assert_eq!(cache.positions(None, None, None, None, None).len(), 1);
+    assert_eq!(
+        serde_json::to_vec(&*cache.position(&position_id).unwrap()).unwrap(),
+        position_before
+    );
+    assert_eq!(
+        serde_json::to_vec(&*cache.account(&account_id).unwrap()).unwrap(),
+        account_before
+    );
+}
+
 fn prepare_order_targeting_cached_position(
     execution_engine: &mut ExecutionEngine,
     instrument_id: InstrumentId,

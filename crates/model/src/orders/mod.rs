@@ -292,6 +292,8 @@ impl OrderStatus {
             (Self::PartiallyFilled, OrderEventAny::FillVoided(_)) => Self::PartiallyFilled,
             (Self::Filled, OrderEventAny::FillVoided(_)) => Self::Voided,
             (Self::Filled, OrderEventAny::Updated(_)) => Self::Filled,
+            (Self::Filled, OrderEventAny::ModifyRejected(_)) => Self::Filled,
+            (Self::Filled, OrderEventAny::CancelRejected(_)) => Self::Filled,
             (Self::Expired, OrderEventAny::Filled(_)) => Self::Filled,  // Real world possibility
             (Self::Expired, OrderEventAny::FillVoided(_)) => Self::Expired,
             (Self::Expired, OrderEventAny::Updated(_)) => Self::Expired,
@@ -4365,6 +4367,84 @@ mod tests {
     }
 
     #[rstest]
+    #[case::modify(false)]
+    #[case::cancel(true)]
+    fn test_filled_order_records_late_rejection_without_changing_exposure(
+        #[case] cancel: bool,
+        #[values(false, true)] late_increase: bool,
+    ) {
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::test_default())
+            .quantity(Quantity::from(2))
+            .build();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let pending = if cancel {
+            OrderEventAny::PendingCancel(OrderPendingCancelSpec::builder().build())
+        } else {
+            OrderEventAny::PendingUpdate(OrderPendingUpdateSpec::builder().build())
+        };
+        order.apply(pending).unwrap();
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .last_qty(Quantity::from(2))
+                    .build(),
+            ))
+            .unwrap();
+        if late_increase {
+            // A quantity ACK alone still does not reopen Filled; this fix only records rejections.
+            order
+                .apply(OrderEventAny::Updated(
+                    OrderUpdatedSpec::builder()
+                        .quantity(Quantity::from(3))
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let before = order.clone();
+        assert_eq!(before.status(), OrderStatus::Filled);
+        assert_eq!(
+            before.leaves_qty(),
+            if late_increase {
+                Quantity::from(1)
+            } else {
+                Quantity::from(0)
+            }
+        );
+        let event = if cancel {
+            OrderEventAny::CancelRejected(
+                OrderCancelRejectedSpec::builder()
+                    .ts_event(UnixNanos::from(3))
+                    .build(),
+            )
+        } else {
+            OrderEventAny::ModifyRejected(
+                OrderModifyRejectedSpec::builder()
+                    .ts_event(UnixNanos::from(3))
+                    .build(),
+            )
+        };
+        order.apply(event.clone()).unwrap();
+        assert_eq!(order.last_event(), &event);
+        assert_eq!(order.event_count(), before.event_count() + 1);
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert!(order.is_closed());
+        assert!(!order.is_open());
+        assert_eq!(order.ts_closed(), before.ts_closed());
+        assert_eq!(order.quantity(), before.quantity());
+        assert_eq!(order.filled_qty(), before.filled_qty());
+        assert_eq!(order.leaves_qty(), before.leaves_qty());
+        assert_eq!(order.avg_px(), before.avg_px());
+        assert_eq!(order.commissions(), before.commissions());
+        assert_eq!(order.trade_ids(), before.trade_ids());
+        assert_eq!(order.position_id(), before.position_id());
+    }
+
+    #[rstest]
     fn test_pending_update_order_restores_status_on_updated() {
         let init = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
@@ -4801,6 +4881,7 @@ mod tests {
                     | OrderStatus::PartiallyFilled
                     | OrderStatus::PendingUpdate
                     | OrderStatus::PendingCancel
+                    | OrderStatus::Filled
             );
             let mut current = status;
             let result = current.transition(&event);
@@ -4829,7 +4910,8 @@ mod tests {
                 | OrderStatus::Triggered
                 | OrderStatus::PartiallyFilled
                 | OrderStatus::PendingUpdate
-                | OrderStatus::PendingCancel => Some(status),
+                | OrderStatus::PendingCancel
+                | OrderStatus::Filled => Some(status),
                 OrderStatus::Initialized
                 | OrderStatus::Emulated
                 | OrderStatus::Released
@@ -4837,7 +4919,6 @@ mod tests {
                 | OrderStatus::Rejected
                 | OrderStatus::Canceled
                 | OrderStatus::Expired
-                | OrderStatus::Filled
                 | OrderStatus::Voided => None,
             };
 
